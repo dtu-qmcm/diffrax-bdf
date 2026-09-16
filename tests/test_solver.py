@@ -3,6 +3,7 @@
 from math import comb
 
 import diffrax
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ import scipy.linalg
 import scipy.integrate._ivp.bdf as scipy_bdf
 
 from diffrax_bdf import BDF
-from diffrax_bdf._bdf import _BDFState, _bdf_residual
+from diffrax_bdf._bdf import _bdf_residual
 from diffrax_bdf._coeffs import D_ROWS, MAX_ORDER, make_tables
 
 from helpers import observed_order, seed_state
@@ -41,15 +42,16 @@ def _rotating_problem():
 
 
 def _fixed_step_error(term, exact, order, h, t1, use_ndf=True):
+    solver = BDF(bdf_order=order, use_ndf=use_ndf, root_finder=TIGHT)
     sol = diffrax.diffeqsolve(
         term,
-        BDF(bdf_order=order, use_ndf=use_ndf, root_finder=TIGHT),
+        solver,
         t0=0.0,
         t1=t1,
         dt0=h,
         y0=exact(0.0),
         stepsize_controller=diffrax.ConstantStepSize(),
-        solver_state=seed_state(exact, 0.0, h, order),
+        solver_state=seed_state(solver, term, exact, 0.0, h, order),
         max_steps=1_000_000,
     )
     return float(jnp.linalg.norm(sol.ys[0] - exact(t1)))
@@ -232,20 +234,20 @@ def test_single_step_solves_the_same_equation_as_scipy(order):
     assert converged
 
     # --- ours ---
-    state = _BDFState(
-        d_array=jnp.asarray(d_array),
-        order=jnp.asarray(order, jnp.int32),
-        n_equal_steps=jnp.asarray(0, jnp.int32),
-        h_prev=jnp.asarray(h),
+    solver = BDF(bdf_order=order, root_finder=TIGHT)
+    term = diffrax.ODETerm(vf)
+    state = eqx.tree_at(
+        lambda s: (s.d_array, s.order, s.n_equal_steps, s.h_prev),
+        solver.init(term, t0, t1, jnp.asarray(d_array[0]), None),
+        (
+            jnp.asarray(d_array),
+            jnp.asarray(order, jnp.int32),
+            jnp.asarray(0, jnp.int32),
+            jnp.asarray(h),
+        ),
     )
-    y1, y_error, _, new_state, result = BDF(bdf_order=order, root_finder=TIGHT).step(
-        diffrax.ODETerm(vf),
-        t0,
-        t1,
-        jnp.asarray(d_array[0]),
-        None,
-        state,
-        False,
+    y1, y_error, _, new_state, result = solver.step(
+        term, t0, t1, jnp.asarray(d_array[0]), None, state, False
     )
     assert result == diffrax.RESULTS.successful
     np.testing.assert_allclose(np.asarray(y1), y_new, rtol=1e-9, atol=1e-11)

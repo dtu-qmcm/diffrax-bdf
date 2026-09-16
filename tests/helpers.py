@@ -1,18 +1,21 @@
 """Shared problem definitions and helpers for the test suite."""
 
 import diffrax
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 
-from diffrax_bdf._bdf import _BDFState
 from diffrax_bdf._coeffs import D_ROWS
 
 
-def seed_state(exact, t0, h, order):
+def seed_state(solver, term, exact, t0, h, order, args=None):
     """Build solver state whose history is the *exact* solution.
 
     Without this the opening order ramp contributes `O(h ** 2)` error and swamps
     the measured convergence slope of any higher-order formula.
+
+    The cached Jacobian and factorisation are taken from the solver's own `init`, so
+    this keeps working as the solver state grows.
     """
     samples = np.array([np.asarray(exact(t0 - i * h)) for i in range(order + 1)])
     d_array = np.zeros((D_ROWS,) + samples.shape[1:])
@@ -20,11 +23,16 @@ def seed_state(exact, t0, h, order):
     for j in range(order + 1):
         d_array[j] = column[0]
         column = column[:-1] - column[1:]
-    return _BDFState(
-        d_array=jnp.asarray(d_array),
-        order=jnp.asarray(order, jnp.int32),
-        n_equal_steps=jnp.asarray(0, jnp.int32),
-        h_prev=jnp.asarray(h),
+    state = solver.init(term, t0, t0 + h, exact(t0), args)
+    return eqx.tree_at(
+        lambda s: (s.d_array, s.order, s.n_equal_steps, s.h_prev),
+        state,
+        (
+            jnp.asarray(d_array),
+            jnp.asarray(order, jnp.int32),
+            jnp.asarray(0, jnp.int32),
+            jnp.asarray(h),
+        ),
     )
 
 

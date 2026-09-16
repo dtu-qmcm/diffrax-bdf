@@ -1,4 +1,5 @@
 from ._bdf import BDF as BDF
+from ._controller import BDFController as BDFController
 from ._coeffs import MAX_ORDER as MAX_ORDER
 
 
