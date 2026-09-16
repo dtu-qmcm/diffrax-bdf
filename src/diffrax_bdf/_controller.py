@@ -16,12 +16,19 @@ import diffrax
 import jax.numpy as jnp
 from jaxtyping import PyTree
 
+from ._bdf import ErrorWithOrder
+
 
 class BDFController(diffrax.PIDController):
-    """`diffrax.PIDController` with CVODE's step-size deadband.
+    """`diffrax.PIDController` with CVODE's step-size deadband and variable-order support.
 
     All of `PIDController`'s arguments apply. The added `eta_max_fx` is the growth
     factor below which an accepted step keeps its step size unchanged.
+
+    This controller is also required by a variable-order [`diffrax_bdf.BDF`][].
+    `diffrax` asks a solver for its error order only once, so a solver whose order
+    changes from step to step has to send the current one along with the error
+    estimate; this controller knows how to read that.
     """
 
     eta_max_fx: float = 1.5
@@ -37,6 +44,12 @@ class BDFController(diffrax.PIDController):
         error_order,
         controller_state,
     ):
+        if isinstance(y_error, ErrorWithOrder):
+            # The step-size exponent is `1 / (p + 1)` for a method of order `p`, so at
+            # variable order it has to follow the order that actually produced this
+            # estimate rather than a value fixed before the solve began.
+            error_order = y_error.order + 1
+            y_error = y_error.error
         keep_step, next_t0, next_t1, made_jump, state, result = super().adapt_step_size(
             t0, t1, y0, y1_candidate, args, y_error, error_order, controller_state
         )

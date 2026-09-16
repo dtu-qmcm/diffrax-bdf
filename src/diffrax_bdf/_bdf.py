@@ -52,6 +52,39 @@ from ._coeffs import D_ROWS, MAX_ORDER, change_D, make_tables, weighted_row_sum
 from ._newton import chord_solve, newton_tolerance, rms_norm
 
 
+class ErrorWithOrder(eqx.Module):
+    """An error estimate together with the BDF order that produced it.
+
+    `diffrax` asks the solver for its error order once, outside the loop
+    (`_integrate.py:388` calls `solver.error_order(terms)`, which sees neither the
+    state nor the time), so a variable-order solver has no way to tell the
+    controller which order the current error estimate belongs to. The step-size
+    controller's only other input from the solver is `y_error`, and the integration
+    loop treats that opaquely -- it only does a structure-agnostic `tree_map` over it
+    (`_integrate.py:386`) -- so the order travels in here alongside the estimate.
+
+    [`diffrax_bdf.BDFController`][] unpacks this. Stock `diffrax.PIDController`
+    cannot: it tree-maps `y_error` against `y0` and will raise on the extra leaf.
+    """
+
+    error: PyTree
+    order: Float[Array, ""]
+
+    def __truediv__(self, other):
+        # `PIDController` tree-maps its scaling function over `(y0, y1, y_error)`,
+        # taking its structure from `y0`, so this whole object arrives where a leaf
+        # was expected and the first thing done to it is a division. Intercepting
+        # that turns an unreadable TypeError into an actionable one.
+        del other
+        raise TypeError(
+            "A variable-order `BDF` reports its error estimate together with the "
+            "order that produced it, and `diffrax.PIDController` cannot read that. "
+            "Either pass `stepsize_controller=diffrax_bdf.BDFController(...)`, which "
+            "can, or pin the order with `BDF(bdf_order=...)` to get a plain error "
+            "estimate that any adaptive controller accepts."
+        )
+
+
 class _BDFState(eqx.Module):
     """The multistep history, plus the cached linear algebra and its age."""
 
@@ -136,7 +169,8 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         LocalLinearInterpolation
     )
 
-    bdf_order: int = eqx.field(static=True, default=4)
+    bdf_order: int | None = eqx.field(static=True, default=None)
+    max_order: int = eqx.field(static=True, default=MAX_ORDER)
     use_ndf: bool = eqx.field(static=True, default=True)
     root_finder: optx.AbstractRootFinder = with_stepsize_controller_tols(VeryChord)()
     root_find_max_steps: int = 4
@@ -146,17 +180,29 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
     max_gamma_change: float = 0.3
 
     def __check_init__(self):
-        if not 1 <= self.bdf_order <= MAX_ORDER:
-            raise ValueError(f"`bdf_order` must be between 1 and {MAX_ORDER}.")
+        if self.bdf_order is not None and not 1 <= self.bdf_order <= MAX_ORDER:
+            raise ValueError(f"`bdf_order` must be between 1 and {MAX_ORDER}, or None.")
+        if not 1 <= self.max_order <= MAX_ORDER:
+            raise ValueError(f"`max_order` must be between 1 and {MAX_ORDER}.")
+
+    @property
+    def _variable_order(self) -> bool:
+        return self.bdf_order is None
+
+    @property
+    def _order_cap(self) -> int:
+        return self.max_order if self._variable_order else self.bdf_order
 
     def order(self, terms):
         del terms
-        return self.bdf_order
+        return self._order_cap
 
     def error_order(self, terms):
         del terms
-        # The local error of a k-th order BDF step is O(h ** (k + 1)).
-        return self.bdf_order + 1
+        # The local error of a k-th order BDF step is O(h ** (k + 1)). At variable
+        # order this is only the value used to pick the very first step size; the
+        # per-step order reaches the controller through `ErrorWithOrder`.
+        return self._order_cap + 1
 
     def func(self, terms, t0, y0, args):
         return terms.vf(t0, y0, args)
@@ -348,19 +394,43 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         did_jac = need_jac | blame_jacobian
         did_lu = need_lu | retry
 
-        y1 = unravel(flat_pred + correction)
+        flat_y1 = flat_pred + correction
+        y1 = unravel(flat_y1)
         y_error = unravel(jnp.asarray(error_const, dtype)[order] * correction)
         # A failed Newton solve is reported as an infinite error estimate so that
         # the controller rejects the step, rather than as a non-successful
         # `RESULTS`, which `diffrax` would treat as a failure of the whole solve.
         y_error = jtu.tree_map(lambda e: jnp.where(converged, e, jnp.inf), y_error)
 
-        d_array = _update_difference_array(
-            d_array, order, unravel(correction)
-        )
+        d_array = _update_difference_array(d_array, order, unravel(correction))
+
+        if self._variable_order:
+            next_order, n_equal_steps = self._select_order(
+                d_array,
+                order,
+                correction,
+                flat_y1,
+                error_const,
+                rtol,
+                atol,
+                n_equal_steps,
+                dtype,
+            )
+            # The order that produced this error estimate is the one the controller
+            # needs, not the one we have just chosen for the next step.
+            y_error = ErrorWithOrder(
+                error=y_error, order=order.astype(dtype)
+            )
+        else:
+            # At fixed order the only movement is the opening ramp: a k-step formula
+            # needs k points of history. A rejected step rolls the state back, so the
+            # ramp is automatically correct -- a step that did not happen does not
+            # advance the order.
+            next_order = jnp.minimum(order + 1, self.bdf_order)
+
         new_state = _BDFState(
             d_array=d_array,
-            order=jnp.minimum(order + 1, self.bdf_order),
+            order=next_order,
             n_equal_steps=n_equal_steps,
             h_prev=control,
             jac=jac,
@@ -376,6 +446,54 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         )
         dense_info = dict(y0=y0, y1=y1)
         return y1, y_error, dense_info, new_state, RESULTS.successful
+
+    def _select_order(
+        self,
+        d_array,
+        order,
+        correction,
+        flat_y1,
+        error_const,
+        rtol,
+        atol,
+        n_equal_steps,
+        dtype,
+    ):
+        """scipy's order heuristic: compare the error at this order, one below, one above.
+
+        The two rows of the difference array beyond `order` exist for exactly this.
+        After `_update_difference_array`, row `order` carries what the error would
+        have been one order lower and row `order + 2` what it would be one order
+        higher, so all three candidates are available without re-solving anything.
+        """
+        table = jnp.asarray(error_const, dtype)
+        scale = atol + rtol * jnp.abs(flat_y1)
+
+        def row(index):
+            return ravel_pytree(jtu.tree_map(lambda x: x[index], d_array))[0]
+
+        error = rms_norm(table[order] * correction / scale)
+        error_lower = rms_norm(table[order - 1] * row(order) / scale)
+        error_higher = rms_norm(table[order + 1] * row(order + 2) / scale)
+        # Candidates outside 1..cap are ruled out with an infinite error, which maps
+        # to a zero factor and so can never win the argmax below.
+        error_lower = jnp.where(order > 1, error_lower, jnp.inf)
+        error_higher = jnp.where(order < self._order_cap, error_higher, jnp.inf)
+
+        exponents = jnp.stack([order, order + 1, order + 2]).astype(dtype)
+        candidates = jnp.stack([error_lower, error, error_higher])
+        factors = candidates ** (-1 / exponents)
+        delta = jnp.argmax(factors) - 1
+
+        # scipy holds the order still until `order + 1` steps of equal size have been
+        # taken. Both the error constants and the difference array assume an equally
+        # spaced history, so changing order before that compares invalid estimates.
+        allowed = n_equal_steps >= order + 1
+        next_order = jnp.where(
+            allowed, jnp.clip(order + delta, 1, self._order_cap), order
+        )
+        n_equal_steps = jnp.where(allowed & (delta != 0), 0, n_equal_steps)
+        return next_order.astype(jnp.int32), n_equal_steps.astype(jnp.int32)
 
     def _restart(
         self,
@@ -409,11 +527,13 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
 
 BDF.__init__.__doc__ = """**Arguments:**
 
-- `bdf_order`: the order of the formula, between 1 and 5. The order ramps up to
-    this value over the opening steps. Higher is consistently faster at tight
-    tolerances; the default of 4 keeps a comfortable stability margin, since BDF4 is
-    A(73.35 degrees)-stable where BDF5 is only A(51.84 degrees)-stable and can go
-    unstable on systems with strongly oscillatory modes.
+- `bdf_order`: pin the formula to a fixed order between 1 and 5, or leave it as
+    `None` (the default) to vary the order between 1 and `max_order` as scipy and
+    CVODE do. Variable order needs [`diffrax_bdf.BDFController`][]; a fixed order
+    works with any adaptive step size controller. Note that a fixed high order is
+    less stable: BDF4 is A(73.35 degrees)-stable and BDF5 only
+    A(51.84 degrees)-stable, so both can go unstable on strongly oscillatory systems.
+- `max_order`: the highest order the variable-order heuristic may select.
 - `use_ndf`: whether to apply the Shampine & Reichelt NDF correction. `False`
     gives the classical BDF coefficients, which is the family SUNDIALS CVODE
     implements.
