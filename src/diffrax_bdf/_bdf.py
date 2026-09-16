@@ -418,9 +418,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
             )
             # The order that produced this error estimate is the one the controller
             # needs, not the one we have just chosen for the next step.
-            y_error = ErrorWithOrder(
-                error=y_error, order=order.astype(dtype)
-            )
+            y_error = ErrorWithOrder(error=y_error, order=order.astype(dtype))
         else:
             # At fixed order the only movement is the opening ramp: a k-step formula
             # needs k points of history. A rejected step rolls the state back, so the
@@ -488,11 +486,21 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         # scipy holds the order still until `order + 1` steps of equal size have been
         # taken. Both the error constants and the difference array assume an equally
         # spaced history, so changing order before that compares invalid estimates.
+        #
+        # scipy additionally freezes the step size between order changes, so that the
+        # count reliably accumulates. That was tried here and measured worse than
+        # letting `BDFController`'s deadband govern the step size (160ms against 124ms
+        # on enzax's methionine model from a bad guess), so the two stay decoupled: the
+        # deadband already holds the step size still often enough for the gate to open.
         allowed = n_equal_steps >= order + 1
         next_order = jnp.where(
             allowed, jnp.clip(order + delta, 1, self._order_cap), order
         )
-        n_equal_steps = jnp.where(allowed & (delta != 0), 0, n_equal_steps)
+        # Restart the count whenever the gate opens, whether or not the order actually
+        # moved. This is scipy's behaviour and it measured slightly better than only
+        # restarting on a real change (423 steps against 454 on enzax's methionine
+        # model from a bad guess).
+        n_equal_steps = jnp.where(allowed, 0, n_equal_steps)
         return next_order.astype(jnp.int32), n_equal_steps.astype(jnp.int32)
 
     def _restart(

@@ -128,6 +128,46 @@ Variable order helps where the order genuinely needs to move -- 231 steps agains
 where order 5 is right throughout, it matches fixed order 5 on step count and pays
 about 8% per step for the heuristic. Reuse is worth a further 16-18%.
 
+## On enzax's models
+
+The motivating case. Measured against
+[enzax](https://github.com/dtu-qmcm/enzax)'s own steady-state configuration
+(`t1=inf`, `steady_state_event`, `ImplicitAdjoint`, `rtol=atol=1e-9`), each solver
+with the step size controller that suits it. Medians of interleaved rounds.
+
+| model | n | regime | `Kvaerno5` (enzax today) | `BDF()` | speedup |
+|---|---|---|---|---|---|
+| methionine | 5 | bad guess | 555 ms (649 steps, 145 rejected) | 158 ms (423, 52) | **3.5x** |
+| methionine | 5 | warm guess, 2% parameter jitter | 30.7 ms (38 steps) | 23.3 ms (88) | 1.3x |
+| methionine | 5 | `jacrev` through the solve | 27.9 ms | 22.4 ms | 1.25x |
+| conserved moiety | 5 | bad guess | 191 ms (225, 30) | 53.7 ms (293, 4) | **3.6x** |
+| conserved moiety | 5 | warm guess, 2% jitter | 58.3 ms (68) | 31.4 ms (165) | 1.9x |
+| conserved moiety | 5 | `jacrev` | 53.0 ms | 27.6 ms | 1.9x |
+| glycolysis | 18 | bad guess | 2302 ms (1007, 247) | 271 ms (821, 70) | **8.5x** |
+| glycolysis | 18 | guess perturbed 20% | 491 ms (212, 38) | 108 ms (277, 18) | **4.6x** |
+| glycolysis | 18 | `jacrev` | 427 ms | 104 ms | **4.1x** |
+
+"bad guess" is enzax's own `BAD_GUESS = full(shape, 0.01)`. Steady states agree with
+`Kvaerno5` to 2e-7 relative or better and gradients to 1e-5 or better.
+
+Note the step counts: BDF often takes *more* steps and is still several times
+faster, because a step is one Newton solve against a reused factorisation rather
+than five stage solves. It also rejects far fewer steps -- 70 against 247 on
+glycolysis from a bad guess. Compile time is 30-45% lower throughout, which matters
+when every leapfrog step of a NUTS chain pays it.
+
+The gap widens with model size, which is the encouraging part: 1.3x on the 5-state
+methionine model against 4-8x on the 18-state glycolysis one.
+
+### Tuning
+
+enzax's `PIDController(pcoeff=0.1, icoeff=0.3)` is tuned for `Kvaerno5`, which
+rejects heavily; it damps step size growth to `0.4 / error_order` where the default
+pure-I controller uses `1 / error_order`. BDF rejects very few steps and does not
+need the damping, so it should be left on `BDFController`'s defaults. Using enzax's
+tuning costs BDF roughly a factor of two -- 174 steps and 45.6 ms against 88 steps
+and 26.9 ms on methionine.
+
 ## Testing
 
 `uv run pytest`. scipy's BDF is pure Python and is used as a white-box oracle: the
