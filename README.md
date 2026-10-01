@@ -34,8 +34,8 @@ including diffrax's own `PIDController`.
 
 ## Status
 
-Variable order 1-5, adaptive step size, and reuse of the Jacobian and its
-factorisation across steps.
+Variable order 1-5, adaptive step size, reuse of the Jacobian and its
+factorisation across steps, and semi-explicit index-1 DAEs.
 
 ## Method
 
@@ -87,6 +87,20 @@ The tail is the useful part: BDF1 with an enormous step *is* Newton's method on
 `f(y) = 0`, so a correct variable-order BDF turns into a steady-state solver by
 itself as it converges.
 
+## Differential algebraic equations
+
+`BDF` also solves semi-explicit index-1 DAEs, where some components of `y` obey differential equations and the rest obey algebraic constraints:
+
+```python
+term = SemiExplicitDAETerm(vector_field, algebraic_mask=(False, True))
+```
+
+Here `vector_field` returns `(f, g)` for `y = (z, u)`, meaning `dz/dt = f` and `0 = g`. The corrector solves the constraints in the same chord iteration as the differential equations, with iteration matrix `M − cJ` where `M` is 1 on differential components and 0 on algebraic ones, and reuses its factorisation across steps as for an ODE.
+
+- By default `init` corrects an inconsistent initial value by a Newton solve on the constraints. diffrax keeps its own copy of `y0`, so `SaveAt(t0=True)` shows the value you passed, not the corrected one.
+- `suppress_algebraic_error=True` drops the algebraic components from the error estimate, which suits problems where only `z` is of interest. On a rapid-equilibrium steady state it saved 29% of steps.
+- The steady-state event and `ImplicitAdjoint` work unchanged: the steady state is the root of `(f, g)`.
+
 ## Caveats
 
 - **Enable `jax_enable_x64`.** High-order backward differences suffer heavy
@@ -97,7 +111,7 @@ itself as it converges.
 - Variable order requires `BDFController`; a fixed `bdf_order` works with any
   adaptive controller.
 - The Jacobian is formed densely, so this suits small to medium systems.
-- Requires a term whose control is a scalar, i.e. `ODETerm`.
+- Requires a term whose control is a scalar, i.e. `ODETerm` or `SemiExplicitDAETerm`.
 
 ## Performance
 
