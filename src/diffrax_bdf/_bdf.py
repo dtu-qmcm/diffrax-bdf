@@ -171,6 +171,9 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
     `PIDController` the step size, and hence `c`, changes on every step, so the
     factorisation is rebuilt every step and the reuse below never engages.
 
+    It also solves semi-explicit index-1 differential algebraic equations given as
+    a [`diffrax_bdf.SemiExplicitDAETerm`][].
+
     !!! warning
 
         The Jacobian is formed densely, so this is intended for small to medium
@@ -640,4 +643,14 @@ BDF.__init__.__doc__ = """**Arguments:**
     automatic-differentiation pass where a refactorisation does not.
 - `max_gamma_change`: refactorise when `c` has moved by more than this relative
     amount since the last factorisation. CVODE's `DGMAX_LSETUP`.
+- `suppress_algebraic_error`: leave the algebraic components of a
+    `SemiExplicitDAETerm` out of the local error estimate and the order
+    selection, as SUNDIALS IDA's `suppressalg` does. Each step's Newton
+    iteration still has to converge on them.
+- `correct_initial_algebraic`: before the first step, solve the constraints of
+    a `SemiExplicitDAETerm` for its algebraic components, holding the others
+    fixed. If this fails, the solve stops with `RESULTS.nonlinear_divergence`.
+    Turn it off when `y0` is known to be consistent.
+- `initial_algebraic_max_steps`: the maximum number of Newton steps in that
+    correction.
 """
