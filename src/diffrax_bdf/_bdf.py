@@ -46,10 +46,11 @@ from diffrax import (
 )
 from equinox.internal import ω
 from jax.flatten_util import ravel_pytree
-from jaxtyping import Array, Float, Int, PyTree
+from jaxtyping import Array, Bool, Float, Int, PyTree
 
 from ._coeffs import D_ROWS, MAX_ORDER, change_D, make_tables, weighted_row_sum
 from ._newton import chord_solve, newton_tolerance, rms_norm
+from ._term import flat_algebraic_mask, split_dae_term
 
 
 class ErrorWithOrder(eqx.Module):
@@ -98,6 +99,7 @@ class _BDFState(eqx.Module):
     c_at_last_lu: Float[Array, ""]
     steps_since_lu: Int[Array, ""]
     steps_since_jac: Int[Array, ""]
+    initial_failed: Bool[Array, ""]
 
 
 def _bdf_residual(d, nonlinear_args):
@@ -113,6 +115,19 @@ def _bdf_residual(d, nonlinear_args):
     # `1 / alpha[order]` gives scipy's `c * f` with `c = h / alpha[order]`.
     c_f = (inv_alpha * vf_prod(t1, y, args, control) ** ω).ω
     return (c_f**ω - psi**ω - d**ω).ω
+
+
+def _zero_algebraic(x, mask):
+    if mask is None:
+        return x
+    flat, unravel = ravel_pytree(x)
+    return unravel(jnp.where(flat_algebraic_mask(mask, x), 0, flat))
+
+
+def _suppress(x, error_mask):
+    if error_mask is None:
+        return x
+    return jnp.where(error_mask, 0, x)
 
 
 def _row_mask(mask, x):
@@ -178,6 +193,9 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
     lu_reuse_steps: int = eqx.field(static=True, default=20)
     jac_reuse_steps: int = eqx.field(static=True, default=51)
     max_gamma_change: float = 0.3
+    suppress_algebraic_error: bool = eqx.field(static=True, default=False)
+    correct_initial_algebraic: bool = eqx.field(static=True, default=True)
+    initial_algebraic_max_steps: int = eqx.field(static=True, default=50)
 
     def __check_init__(self):
         if self.bdf_order is not None and not 1 <= self.bdf_order <= MAX_ORDER:
@@ -205,6 +223,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         return self._order_cap + 1
 
     def func(self, terms, t0, y0, args):
+        terms, _ = split_dae_term(terms)
         return terms.vf(t0, y0, args)
 
     def _tolerances(self):
@@ -220,6 +239,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         return rtol, atol
 
     def init(self, terms, t0, t1, y0, args) -> _BDFState:
+        terms, mask = split_dae_term(terms)
         control = terms.contr(t0, t1)
         if jnp.shape(control) != ():
             raise ValueError(
@@ -227,10 +247,16 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
                 f"got a control of shape {jnp.shape(control)}. The step-size ratio "
                 "used to rescale the difference array is not defined otherwise."
             )
-        # Start at order 1 with `D = [y0, h * f0]`, matching scipy. The remaining
-        # rows are zero rather than uninitialised so that a high-order formula
-        # applied before enough history exists degenerates gracefully.
-        f0 = terms.vf_prod(t0, y0, args, control)
+        if mask is not None and self.correct_initial_algebraic:
+            y0, initial_failed = self._correct_algebraic(terms, t0, y0, args, mask)
+        else:
+            initial_failed = jnp.asarray(False)
+        # Start at order 1 with `D = [y0, h * f0]`, matching scipy, except that the
+        # algebraic components of `h * f0` are zero: there `f0` is a constraint
+        # residual, not a derivative. The remaining rows are zero rather than
+        # uninitialised so that a high-order formula applied before enough history
+        # exists degenerates gracefully.
+        f0 = _zero_algebraic(terms.vf_prod(t0, y0, args, control), mask)
         d_array = jtu.tree_map(
             lambda y, f: jnp.zeros((D_ROWS,) + jnp.shape(y), jnp.result_type(y))
             .at[0]
@@ -255,7 +281,30 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
             # Start both counters expired so the first step builds everything.
             steps_since_lu=jnp.asarray(self.lu_reuse_steps, jnp.int32),
             steps_since_jac=jnp.asarray(self.jac_reuse_steps, jnp.int32),
+            initial_failed=initial_failed,
         )
+
+    def _correct_algebraic(self, terms, t0, y0, args, mask):
+        flat_y0, unravel = ravel_pytree(y0)
+        flat_mask = flat_algebraic_mask(mask, y0)
+
+        def residual(flat, _):
+            f = ravel_pytree(terms.vf(t0, unravel(flat), args))[0]
+            return jnp.where(flat_mask, f, flat - flat_y0)
+
+        rtol, atol = self._tolerances()
+        solution = optx.root_find(
+            residual,
+            optx.Newton(rtol=rtol, atol=atol),
+            flat_y0,
+            max_steps=self.initial_algebraic_max_steps,
+            throw=False,
+        )
+        failed = (solution.result != optx.RESULTS.successful) | jnp.invert(
+            jnp.all(jnp.isfinite(solution.value))
+        )
+        corrected = jnp.where(failed, flat_y0, solution.value)
+        return unravel(corrected), failed
 
     def _should_update(self, state, c):
         """CVODE's two-tier gate on the Jacobian and its factorisation.
@@ -278,6 +327,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         return need_jac, need_lu, gamma_change
 
     def step(self, terms, t0, t1, y0, args, solver_state, made_jump):
+        terms, mask = split_dae_term(terms)
         control = terms.contr(t0, t1)
         gamma_table, alpha_table, error_const = make_tables(self.use_ndf)
 
@@ -306,6 +356,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
                 n_equal_steps,
                 steps_since_jac,
                 made_jump,
+                mask,
             )
 
         flat_y0, unravel = ravel_pytree(y0)
@@ -325,10 +376,23 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         def vector_field(flat):
             return ravel_pytree(terms.vf(t1, unravel(flat), args))[0]
 
+        if mask is None:
+            flat_mask = None
+            mass = jnp.eye(size, dtype=dtype)
+        else:
+            flat_mask = flat_algebraic_mask(mask, y0)
+            mass = jnp.diag(jnp.where(flat_mask, 0, 1).astype(dtype))
+
         def residual(correction):
             y = unravel(flat_pred + correction)
             scaled = ravel_pytree(terms.vf_prod(t1, y, args, control))[0] * inv_alpha
-            return scaled - flat_psi - correction
+            if flat_mask is None:
+                return scaled - flat_psi - correction
+            return (
+                scaled
+                - jnp.where(flat_mask, 0, flat_psi)
+                - jnp.where(flat_mask, 0, correction)
+            )
 
         state = eqx.tree_at(
             lambda s: s.steps_since_jac, solver_state, steps_since_jac
@@ -338,10 +402,9 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         rtol, atol = self._tolerances()
         scale = atol + rtol * jnp.abs(flat_pred)
         tol = newton_tolerance(rtol, dtype)
-        identity = jnp.eye(size, dtype=dtype)
 
         def factorise(jacobian):
-            return jsl.lu_factor(identity - c * jacobian)
+            return jsl.lu_factor(mass - c * jacobian)
 
         jac = jax.lax.cond(
             need_jac, lambda: jax.jacfwd(vector_field)(flat_pred), lambda: state.jac
@@ -396,11 +459,22 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
 
         flat_y1 = flat_pred + correction
         y1 = unravel(flat_y1)
-        y_error = unravel(jnp.asarray(error_const, dtype)[order] * correction)
+        if self.suppress_algebraic_error:
+            error_mask = flat_mask
+        else:
+            error_mask = None
+        y_error = unravel(
+            _suppress(jnp.asarray(error_const, dtype)[order] * correction, error_mask)
+        )
         # A failed Newton solve is reported as an infinite error estimate so that
         # the controller rejects the step, rather than as a non-successful
         # `RESULTS`, which `diffrax` would treat as a failure of the whole solve.
         y_error = jtu.tree_map(lambda e: jnp.where(converged, e, jnp.inf), y_error)
+        # If `init` failed, accept this step so that diffrax sees its result;
+        # diffrax ignores the result of a rejected step.
+        y_error = jtu.tree_map(
+            lambda e: jnp.where(state.initial_failed, 0, e), y_error
+        )
 
         d_array = _update_difference_array(d_array, order, unravel(correction))
 
@@ -415,6 +489,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
                 atol,
                 n_equal_steps,
                 dtype,
+                error_mask,
             )
             # The order that produced this error estimate is the one the controller
             # needs, not the one we have just chosen for the next step.
@@ -441,9 +516,13 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
             steps_since_jac=jnp.where(did_jac, 0, state.steps_since_jac + 1).astype(
                 jnp.int32
             ),
+            initial_failed=state.initial_failed,
         )
         dense_info = dict(y0=y0, y1=y1)
-        return y1, y_error, dense_info, new_state, RESULTS.successful
+        result = RESULTS.where(
+            state.initial_failed, RESULTS.nonlinear_divergence, RESULTS.successful
+        )
+        return y1, y_error, dense_info, new_state, result
 
     def _select_order(
         self,
@@ -456,6 +535,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         atol,
         n_equal_steps,
         dtype,
+        error_mask,
     ):
         """scipy's order heuristic: compare the error at this order, one below, one above.
 
@@ -468,8 +548,10 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         scale = atol + rtol * jnp.abs(flat_y1)
 
         def row(index):
-            return ravel_pytree(jtu.tree_map(lambda x: x[index], d_array))[0]
+            flat_row = ravel_pytree(jtu.tree_map(lambda x: x[index], d_array))[0]
+            return _suppress(flat_row, error_mask)
 
+        correction = _suppress(correction, error_mask)
         error = rms_norm(table[order] * correction / scale)
         error_lower = rms_norm(table[order - 1] * row(order) / scale)
         error_higher = rms_norm(table[order + 1] * row(order + 2) / scale)
@@ -515,9 +597,10 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         n_equal_steps,
         steps_since_jac,
         made_jump,
+        mask,
     ):
         """Rebuild the history from scratch after a discontinuity."""
-        f0 = terms.vf_prod(t0, y0, args, control)
+        f0 = _zero_algebraic(terms.vf_prod(t0, y0, args, control), mask)
 
         def reset(x, y, f):
             fresh = jnp.zeros_like(x).at[0].set(y).at[1].set(f)
