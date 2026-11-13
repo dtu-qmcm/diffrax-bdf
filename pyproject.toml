@@ -1,7 +1,7 @@
 [project]
 name = "diffrax-bdf"
 version = "0.1.0"
-description = "Add your description here"
+description = "Diffrax-compatible backward differentiation formula ODE solver"
 readme = "README.md"
 authors = [
     { email = "groves.teddy@gmail.com" }
