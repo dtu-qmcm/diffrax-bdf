@@ -1,7 +1,7 @@
 [project]
 name = "diffrax-bdf"
 version = "0.1.0"
-description = "Add your description here"
+description = "Diffrax-compatible backward differentiation formula ODE solver"
 readme = "README.md"
 authors = [
     { email = "groves.teddy@gmail.com" }
@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "diffrax>=0.7.2",
 ]
+license = {text = "MIT"}
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]
