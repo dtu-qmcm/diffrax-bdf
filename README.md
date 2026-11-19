@@ -34,8 +34,9 @@ including diffrax's own `PIDController`.
 
 ## Status
 
-Variable order 1-5, adaptive step size, reuse of the Jacobian and its
-factorisation across steps, and semi-explicit index-1 DAEs.
+Variable order 1-5 with stability limit detection, adaptive step size, reuse of the
+Jacobian and its factorisation across steps (also under `vmap`), and semi-explicit
+index-1 DAEs.
 
 ## Method
 
@@ -87,6 +88,16 @@ The tail is the useful part: BDF1 with an enormous step *is* Newton's method on
 `f(y) = 0`, so a correct variable-order BDF turns into a steady-state solver by
 itself as it converges.
 
+## Stability limit detection
+
+BDF orders 3 to 5 are only A(α)-stable, so an eigenvalue close to the imaginary axis makes them unstable at moderate step sizes. A weakly damped oscillation then holds the step size at the edge of stability. scipy's heuristic keeps the order high because the solution looks smooth, and the solve stalls short of its steady state. On a variant of enzax's glycolysis model, a mode 87 degrees from the negative real axis made BDF hit 10,000 steps where `Kvaerno5` needed about 200.
+
+`BDF` therefore runs SUNDIALS CVODE's stability limit detection (STALD). From the last five steps it estimates whether the error is growing at the rate a stability limit produces, and if so lowers the highest order the solve may use. Unlike CVODE, which lowers only the next order, the cap holds for the rest of the solve, because scipy's heuristic otherwise raises the order straight back. Turn it off with `stability_limit_detection=False`. It costs nothing measurable on a single solve, and about 13% under `vmap` on a 19-state model.
+
+## Batching with vmap
+
+Under `vmap`, a `lax.cond` whose predicate differs between members becomes a select, which runs both branches. Done naively, that would rebuild the Jacobian and its factorisation at every step for every member. Instead, each reuse decision runs its branch only when some member needs it, and each member keeps only its own refresh. On enzax's three-experiment glycolysis case study, this took a batched solve from 922 ms to 267 ms, against 374 ms for `Kvaerno5`. All members still step together until the last one finishes.
+
 ## Differential algebraic equations
 
 `BDF` also solves semi-explicit index-1 DAEs, where some components of `y` obey differential equations and the rest obey algebraic constraints:
@@ -112,6 +123,9 @@ Here `vector_field` returns `(f, g)` for `y = (z, u)`, meaning `dz/dt = f` and `
   adaptive controller.
 - The Jacobian is formed densely, so this suits small to medium systems.
 - Requires a term whose control is a scalar, i.e. `ODETerm` or `SemiExplicitDAETerm`.
+- Stability limit detection lowers the order for the rest of the solve, so a solve
+  that meets an oscillatory transient may finish at order 2 with small steps.
+  `Kvaerno5` can be faster on such problems.
 
 ## Performance
 
@@ -188,4 +202,11 @@ and 26.9 ms on methionine.
 coefficient tables, the difference-array rescaling, and a single pinned step are all
 asserted against it directly. The reuse policy, the deadband and the order-selection
 heuristic are tested directly as well, since without them the solver has no
-advantage over `Kvaerno5` at all.
+advantage over `Kvaerno5` at all. Stability limit detection is checked against a
+line-by-line NumPy port of CVODE's `cvSLdet` (`tests/stald_reference.py`), on random
+histories and on histories recorded from a stalling solve.
+
+## Licence
+
+MIT, except `src/diffrax_bdf/_stald.py` and `tests/stald_reference.py`, which are
+ported from SUNDIALS and keep its BSD-3-Clause licence; see `LICENSES/`.
