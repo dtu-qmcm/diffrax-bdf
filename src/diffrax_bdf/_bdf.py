@@ -30,6 +30,7 @@ from collections.abc import Callable
 from typing import ClassVar
 
 import equinox as eqx
+import equinox.internal as eqxi
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
@@ -50,6 +51,7 @@ from jaxtyping import Array, Bool, Float, Int, PyTree
 
 from ._coeffs import D_ROWS, MAX_ORDER, change_D, make_tables, weighted_row_sum
 from ._newton import chord_solve, newton_tolerance, rms_norm
+from ._stald import N_HISTORY, stability_limit_flag
 from ._term import flat_algebraic_mask, split_dae_term
 
 
@@ -87,7 +89,8 @@ class ErrorWithOrder(eqx.Module):
 
 
 class _BDFState(eqx.Module):
-    """The multistep history, plus the cached linear algebra and its age."""
+    """The multistep history, the cached linear algebra and its age, and what
+    stability limit detection needs."""
 
     d_array: PyTree[Float[Array, "8 ..."]]
     order: Int[Array, ""]
@@ -100,6 +103,9 @@ class _BDFState(eqx.Module):
     steps_since_lu: Int[Array, ""]
     steps_since_jac: Int[Array, ""]
     initial_failed: Bool[Array, ""]
+    stability_history: Float[Array, "5 3"]
+    steps_at_order: Int[Array, ""]
+    stable_order: Int[Array, ""]
 
 
 def _bdf_residual(d, nonlinear_args):
@@ -133,6 +139,33 @@ def _suppress(x, error_mask):
 def _row_mask(mask, x):
     """Broadcast a length-`D_ROWS` row mask against a leaf of the difference array."""
     return jnp.reshape(mask, (-1,) + (1,) * (jnp.ndim(x) - 1))
+
+
+def _batch_cond(pred, true_fn, false_fn):
+    """`lax.cond`, but cheap under `vmap`.
+
+    Under `vmap`, a cond whose predicate differs between members becomes a select,
+    which runs both branches for every member. Here the branch runs only when some
+    member needs it (via `eqxi.unvmap_any`), and each member keeps the new value
+    only where its own predicate holds. Without `vmap` it acts as an ordinary cond.
+    Every reuse decision goes through it: otherwise a batch would recompute the
+    Jacobian and its factorisation at every step, and the solver would lose its
+    advantage over `Kvaerno5`.
+    """
+
+    def select():
+        return jtu.tree_map(
+            lambda new, old: jnp.where(pred, new, old), true_fn(), false_fn()
+        )
+
+    return jax.lax.cond(eqxi.unvmap_any(pred), select, false_fn)
+
+
+def _flat_row(d_array, index, error_mask):
+    """One row of the difference array as a flat vector, with the components that
+    `error_mask` marks set to zero."""
+    flat_row = ravel_pytree(jtu.tree_map(lambda x: x[index], d_array))[0]
+    return _suppress(flat_row, error_mask)
 
 
 def _update_difference_array(d_array, order, correction):
@@ -174,6 +207,10 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
     It also solves semi-explicit index-1 differential algebraic equations given as
     a [`diffrax_bdf.SemiExplicitDAETerm`][].
 
+    At variable order it also watches for steps limited by stability rather than
+    accuracy, and lowers its highest order when it finds one; see
+    `stability_limit_detection`.
+
     !!! warning
 
         The Jacobian is formed densely, so this is intended for small to medium
@@ -199,6 +236,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
     suppress_algebraic_error: bool = eqx.field(static=True, default=False)
     correct_initial_algebraic: bool = eqx.field(static=True, default=True)
     initial_algebraic_max_steps: int = eqx.field(static=True, default=50)
+    stability_limit_detection: bool = eqx.field(static=True, default=True)
 
     def __check_init__(self):
         if self.bdf_order is not None and not 1 <= self.bdf_order <= MAX_ORDER:
@@ -285,6 +323,9 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
             steps_since_lu=jnp.asarray(self.lu_reuse_steps, jnp.int32),
             steps_since_jac=jnp.asarray(self.jac_reuse_steps, jnp.int32),
             initial_failed=initial_failed,
+            stability_history=jnp.zeros((N_HISTORY, 3), dtype),
+            steps_at_order=jnp.asarray(0, jnp.int32),
+            stable_order=jnp.asarray(self._order_cap, jnp.int32),
         )
 
     def _correct_algebraic(self, terms, t0, y0, args, mask):
@@ -409,10 +450,10 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         def factorise(jacobian):
             return jsl.lu_factor(mass - c * jacobian)
 
-        jac = jax.lax.cond(
+        jac = _batch_cond(
             need_jac, lambda: jax.jacfwd(vector_field)(flat_pred), lambda: state.jac
         )
-        lu, piv = jax.lax.cond(
+        lu, piv = _batch_cond(
             need_lu, lambda: factorise(jac), lambda: (state.lu, state.piv)
         )
         guess = jnp.zeros_like(flat_pred)
@@ -441,7 +482,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         blame_jacobian = retry & lu_is_current
 
         def refresh():
-            fresh_jac = jax.lax.cond(
+            fresh_jac = _batch_cond(
                 blame_jacobian,
                 lambda: jax.jacfwd(vector_field)(flat_pred),
                 lambda: jac,
@@ -452,7 +493,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
             )
             return fresh_jac, fresh_lu, fresh_piv, retried, retried_converged
 
-        jac, lu, piv, correction, converged = jax.lax.cond(
+        jac, lu, piv, correction, converged = _batch_cond(
             retry,
             refresh,
             lambda: (jac, lu, piv, correction, converged),
@@ -482,6 +523,7 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         d_array = _update_difference_array(d_array, order, unravel(correction))
 
         if self._variable_order:
+            may_change_order = n_equal_steps >= order + 1
             next_order, n_equal_steps = self._select_order(
                 d_array,
                 order,
@@ -494,6 +536,29 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
                 dtype,
                 error_mask,
             )
+            if self.stability_limit_detection:
+                (
+                    next_order,
+                    n_equal_steps,
+                    stability_history,
+                    steps_at_order,
+                    stable_order,
+                ) = self._detect_stability_limit(
+                    state,
+                    d_array,
+                    order,
+                    may_change_order,
+                    next_order,
+                    n_equal_steps,
+                    flat_y1,
+                    rtol,
+                    atol,
+                    error_mask,
+                )
+            else:
+                stability_history = state.stability_history
+                steps_at_order = state.steps_at_order
+                stable_order = state.stable_order
             # The order that produced this error estimate is the one the controller
             # needs, not the one we have just chosen for the next step.
             y_error = ErrorWithOrder(error=y_error, order=order.astype(dtype))
@@ -503,6 +568,9 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
             # ramp is automatically correct -- a step that did not happen does not
             # advance the order.
             next_order = jnp.minimum(order + 1, self.bdf_order)
+            stability_history = state.stability_history
+            steps_at_order = state.steps_at_order
+            stable_order = state.stable_order
 
         new_state = _BDFState(
             d_array=d_array,
@@ -520,6 +588,9 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
                 jnp.int32
             ),
             initial_failed=state.initial_failed,
+            stability_history=stability_history,
+            steps_at_order=steps_at_order,
+            stable_order=stable_order,
         )
         dense_info = dict(y0=y0, y1=y1)
         result = RESULTS.where(
@@ -550,14 +621,14 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         table = jnp.asarray(error_const, dtype)
         scale = atol + rtol * jnp.abs(flat_y1)
 
-        def row(index):
-            flat_row = ravel_pytree(jtu.tree_map(lambda x: x[index], d_array))[0]
-            return _suppress(flat_row, error_mask)
-
         correction = _suppress(correction, error_mask)
         error = rms_norm(table[order] * correction / scale)
-        error_lower = rms_norm(table[order - 1] * row(order) / scale)
-        error_higher = rms_norm(table[order + 1] * row(order + 2) / scale)
+        error_lower = rms_norm(
+            table[order - 1] * _flat_row(d_array, order, error_mask) / scale
+        )
+        error_higher = rms_norm(
+            table[order + 1] * _flat_row(d_array, order + 2, error_mask) / scale
+        )
         # Candidates outside 1..cap are ruled out with an infinite error, which maps
         # to a zero factor and so can never win the argmax below.
         error_lower = jnp.where(order > 1, error_lower, jnp.inf)
@@ -587,6 +658,78 @@ class BDF(AbstractImplicitSolver, AbstractAdaptiveSolver):
         # model from a bad guess).
         n_equal_steps = jnp.where(allowed, 0, n_equal_steps)
         return next_order.astype(jnp.int32), n_equal_steps.astype(jnp.int32)
+
+    def _detect_stability_limit(
+        self,
+        state,
+        d_array,
+        order,
+        may_change_order,
+        next_order,
+        n_equal_steps,
+        flat_y1,
+        rtol,
+        atol,
+        error_mask,
+    ):
+        """Lower the order cap if the last five steps show a stability limit.
+
+        Records this step's three scaled derivative norms, as CVODE's `cvBDFStab`
+        does, but from the backward differences. At constant step size,
+        `||D[q-1] + (q-1)/2 D[q]||`, `||D[q]||` and `||D[q+1]||` equal CVODE's
+        `(q-1)! ||z[q-1]||`, `q! ||z[q]||` and its order `q + 1` estimate exactly.
+        The plain rows agree only to leading order, and `cvSLdet`'s consistency
+        checks reject them.
+
+        The check runs only when the order may change anyway, after at least
+        `order + 5` steps at the current order, and when order selection isn't
+        already lowering it. A detection lowers `stable_order`, which caps the order
+        for the rest of the solve. CVODE lowers only the next order, but here
+        scipy's heuristic raised it again within a few steps and the solve still
+        stalled. With the cap, repeated detections ratchet the order down until it
+        is stable.
+        """
+        dtype = flat_y1.dtype
+        scale = atol + rtol * jnp.abs(flat_y1)
+        lower = _flat_row(d_array, order - 1, error_mask)
+        current = _flat_row(d_array, order, error_mask)
+        upper = _flat_row(d_array, order + 1, error_mask)
+        half_order = (order - 1).astype(dtype) / 2
+        components = jnp.stack(
+            [
+                rms_norm((lower + half_order * current) / scale),
+                rms_norm(current / scale),
+                rms_norm(upper / scale),
+            ]
+        )
+        pushed = jnp.concatenate(
+            [components[None] ** 2, state.stability_history[:-1]]
+        )
+        stability_history = jnp.where(order >= 3, pushed, state.stability_history)
+        steps_at_order = state.steps_at_order + 1
+        eligible = (
+            may_change_order
+            & (order >= 3)
+            & (steps_at_order >= order + 5)
+            & (next_order >= order)
+        )
+        flag = _batch_cond(
+            eligible,
+            lambda: stability_limit_flag(stability_history, order)[0],
+            lambda: jnp.asarray(0, jnp.int32),
+        )
+        violated = eligible & (flag > 3)
+        stable_order = jnp.where(violated, order - 1, state.stable_order)
+        next_order = jnp.minimum(next_order, stable_order)
+        n_equal_steps = jnp.where(violated, 0, n_equal_steps)
+        steps_at_order = jnp.where(next_order == order, steps_at_order, 0)
+        return (
+            next_order.astype(jnp.int32),
+            n_equal_steps.astype(jnp.int32),
+            stability_history,
+            steps_at_order.astype(jnp.int32),
+            stable_order.astype(jnp.int32),
+        )
 
     def _restart(
         self,
@@ -653,4 +796,12 @@ BDF.__init__.__doc__ = """**Arguments:**
     Turn it off when `y0` is known to be consistent.
 - `initial_algebraic_max_steps`: the maximum number of Newton steps in that
     correction.
+- `stability_limit_detection`: watch for steps held down by stability rather
+    than accuracy, as SUNDIALS CVODE's STALD does, and lower the highest order
+    the solve may use each time one is found. BDF orders above 2 are unstable
+    for eigenvalues near the imaginary axis, so without this a weakly damped
+    oscillation can stall the solve at high order. Applies only at variable
+    order. It costs nothing measurable on a single solve, but under `vmap` it
+    slowed a 19-state model's solves by about 13%, so turn it off for systems
+    known to have no such oscillations.
 """

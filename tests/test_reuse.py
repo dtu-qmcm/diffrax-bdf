@@ -295,3 +295,30 @@ def test_gradients_still_exact_with_reuse():
         rtol=1e-5,
         atol=1e-9,
     )
+
+
+def test_vmap_matches_a_sequential_loop():
+    """Members of a batch keep only their own refreshes, so batching must not change
+    a solve beyond the solver's tolerance."""
+    batch = FAST_EQUILIBRIUM_ARGS * jnp.array([[1.0], [3.0], [0.3]])
+
+    def solve(args):
+        solution = diffrax.diffeqsolve(
+            diffrax.ODETerm(fast_equilibrium_vf),
+            BDF(),
+            t0=0.0,
+            t1=jnp.inf,
+            dt0=1e-6,
+            y0=FAST_EQUILIBRIUM_Y0,
+            args=args,
+            stepsize_controller=BDFController(rtol=1e-8, atol=1e-10, dtmax=1e6),
+            event=diffrax.Event(diffrax.steady_state_event(rtol=1e-10, atol=1e-10)),
+            saveat=diffrax.SaveAt(t1=True),
+            max_steps=100_000,
+        )
+        return solution.ys[0]
+
+    batched = jax.jit(jax.vmap(solve))(batch)
+    for position, args in enumerate(batch):
+        alone = jax.jit(solve)(args)
+        np.testing.assert_allclose(batched[position], alone, rtol=1e-8)
